@@ -1,13 +1,13 @@
-# Домашнее задание к лекции «Flask»
+# Домашнее задание к лекции «Aiohttp»
 
-REST API для сайта объявлений на Flask + SQLAlchemy + PostgreSQL.
+REST API для сайта объявлений на aiohttp + SQLAlchemy (async) + PostgreSQL.
 
-## Запуск
+## Запуск локально
 
 1. Поднять PostgreSQL:
 
 ```bash
-docker compose --env-file .env up -d
+docker compose --env-file .env up -d db
 ```
 
 2. Установить зависимости:
@@ -28,6 +28,20 @@ python server.py
 
 ```bash
 python client.py
+```
+
+## Запуск в Docker (задание 2)
+
+```bash
+docker compose --env-file .env up --build -d
+```
+
+Проверка роута:
+
+```bash
+curl -X POST http://127.0.0.1:8080/users \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com","password":"secret"}'
 ```
 
 ## API
@@ -54,12 +68,12 @@ python client.py
 
 ```bash
 # регистрация
-curl -X POST http://127.0.0.1:5000/users \
+curl -X POST http://127.0.0.1:8080/users \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","password":"secret"}'
 
 # создать объявление
-curl -X POST http://127.0.0.1:5000/advertisements \
+curl -X POST http://127.0.0.1:8080/advertisements \
   -u user@example.com:secret \
   -H "Content-Type: application/json" \
   -d '{"title":"Продам ноутбук","description":"Отличное состояние"}'

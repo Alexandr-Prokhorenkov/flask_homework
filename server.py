@@ -1,154 +1,201 @@
-from flask import Flask, Response, jsonify, request
-from flask.views import MethodView
-from flask_bcrypt import Bcrypt
+import base64
+import json
+
+from aiohttp import BasicAuth, web
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from db import Advertisement, Session, User
+from auth import check_password, hash_password
+from db import Advertisement, Session, User, close_db, init_db
 from errors import HttpError
 from schema import CreateAdvertisement, CreateUser, UpdateAdvertisement, validate
 
-app = Flask("app")
-bcrypt = Bcrypt(app)
+
+async def orm_context(app: web.Application):
+    print("START")
+    await init_db()
+    yield
+    await close_db()
+    print("END")
 
 
-def hash_password(password: str) -> str:
-    password = password.encode()
-    password = bcrypt.generate_password_hash(password)
-    password = password.decode()
-    return password
+@web.middleware
+async def session_middleware(request: web.Request, handler):
+    async with Session() as session:
+        request["session"] = session
+        return await handler(request)
 
 
-def check_password(password: str, password_hash: str) -> bool:
-    return bcrypt.check_password_hash(password_hash, password.encode())
+@web.middleware
+async def error_middleware(request: web.Request, handler):
+    try:
+        return await handler(request)
+    except HttpError as err:
+        return web.json_response({"error": err.message}, status=err.status_code)
 
 
-@app.before_request
-def before_request():
-    session = Session()
-    request.session = session
+app = web.Application()
+app.cleanup_ctx.append(orm_context)
+app.middlewares.append(error_middleware)
+app.middlewares.append(session_middleware)
 
 
-@app.after_request
-def after_requests(response: Response):
-    request.session.close()
-    return response
+def get_error(
+    err_cls: type[web.HTTPException],
+    err_msg: dict | list | str,
+):
+    return err_cls(
+        text=json.dumps({"error": err_msg}),
+        content_type="application/json",
+    )
 
 
-@app.errorhandler(HttpError)
-def error_handler(err: HttpError):
-    response = jsonify({"error": err.message})
-    response.status_code = err.status_code
-    return response
-
-
-def get_user(user_id: int) -> User:
-    user = request.session.get(User, user_id)
+async def get_user(session: AsyncSession, user_id: int) -> User:
+    user = await session.get(User, user_id)
     if user is None:
-        raise HttpError("user not found", 404)
+        raise get_error(web.HTTPNotFound, "user not found")
     return user
 
 
-def get_advertisement(advertisement_id: int) -> Advertisement:
-    advertisement = request.session.get(Advertisement, advertisement_id)
+async def get_advertisement(
+    session: AsyncSession, advertisement_id: int
+) -> Advertisement:
+    result = await session.execute(
+        select(Advertisement)
+        .options(selectinload(Advertisement.owner))
+        .where(Advertisement.id == advertisement_id)
+    )
+    advertisement = result.scalar_one_or_none()
     if advertisement is None:
-        raise HttpError("advertisement not found", 404)
+        raise get_error(web.HTTPNotFound, "advertisement not found")
     return advertisement
 
 
-def add_user(user: User):
-    request.session.add(user)
+async def add_user(session: AsyncSession, user: User) -> None:
+    session.add(user)
     try:
-        request.session.commit()
+        await session.commit()
     except IntegrityError:
-        raise HttpError("user already exists", 400)
+        raise get_error(web.HTTPBadRequest, "user already exists")
 
 
-def get_current_user() -> User:
-    auth = request.authorization
-    if auth is None or not auth.username or not auth.password:
-        raise HttpError("unauthorized", 401)
+def parse_basic_auth(request: web.Request) -> BasicAuth | None:
+    header = request.headers.get("Authorization")
+    if header is None or not header.startswith("Basic "):
+        return None
+    try:
+        decoded = base64.b64decode(header[6:]).decode()
+        username, _, password = decoded.partition(":")
+        if not username or not password:
+            return None
+        return BasicAuth(username, password)
+    except Exception:
+        return None
 
-    user = request.session.scalar(select(User).where(User.email == auth.username))
+
+async def get_current_user(request: web.Request) -> User:
+    auth = parse_basic_auth(request)
+    if auth is None:
+        raise get_error(web.HTTPUnauthorized, "unauthorized")
+
+    session: AsyncSession = request["session"]
+    user = await session.scalar(select(User).where(User.email == auth.login))
     if user is None or not check_password(auth.password, user.password):
-        raise HttpError("unauthorized", 401)
+        raise get_error(web.HTTPUnauthorized, "unauthorized")
     return user
 
 
-def check_owner(advertisement: Advertisement, user: User):
+def check_owner(advertisement: Advertisement, user: User) -> None:
     if advertisement.owner_id != user.id:
-        raise HttpError("forbidden", 403)
+        raise get_error(web.HTTPForbidden, "forbidden")
 
 
-class UserView(MethodView):
-    def get(self, user_id: int):
-        user = get_user(user_id)
-        return jsonify(user.dict)
+class UserView(web.View):
+    @property
+    def session(self) -> AsyncSession:
+        return self.request["session"]
 
-    def post(self):
-        json_data = validate(request.json, CreateUser)
+    @property
+    def user_id(self) -> int:
+        return int(self.request.match_info["user_id"])
+
+    async def get(self):
+        user = await get_user(self.session, self.user_id)
+        return web.json_response(user.dict)
+
+    async def post(self):
+        json_data = validate(await self.request.json(), CreateUser)
         user = User(
             email=json_data["email"],
             password=hash_password(json_data["password"]),
         )
-        add_user(user)
-        return jsonify(user.id_dict), 201
+        await add_user(self.session, user)
+        return web.json_response(user.id_dict, status=201)
 
 
-class AdvertisementView(MethodView):
-    def get(self, advertisement_id: int):
-        advertisement = get_advertisement(advertisement_id)
-        return jsonify(advertisement.dict)
+class AdvertisementView(web.View):
+    @property
+    def session(self) -> AsyncSession:
+        return self.request["session"]
 
-    def post(self):
-        user = get_current_user()
-        json_data = validate(request.json, CreateAdvertisement)
+    @property
+    def advertisement_id(self) -> int:
+        return int(self.request.match_info["advertisement_id"])
+
+    async def get(self):
+        advertisement = await get_advertisement(self.session, self.advertisement_id)
+        return web.json_response(advertisement.dict)
+
+    async def post(self):
+        user = await get_current_user(self.request)
+        json_data = validate(await self.request.json(), CreateAdvertisement)
         advertisement = Advertisement(
             title=json_data["title"],
             description=json_data["description"],
             owner_id=user.id,
         )
-        request.session.add(advertisement)
-        request.session.commit()
-        return jsonify(advertisement.id_dict), 201
+        self.session.add(advertisement)
+        await self.session.commit()
+        return web.json_response(advertisement.id_dict, status=201)
 
-    def patch(self, advertisement_id: int):
-        user = get_current_user()
-        advertisement = get_advertisement(advertisement_id)
+    async def patch(self):
+        user = await get_current_user(self.request)
+        advertisement = await get_advertisement(self.session, self.advertisement_id)
         check_owner(advertisement, user)
 
-        json_data = validate(request.json, UpdateAdvertisement)
+        json_data = validate(await self.request.json(), UpdateAdvertisement)
         if "title" in json_data:
             advertisement.title = json_data["title"]
         if "description" in json_data:
             advertisement.description = json_data["description"]
 
-        request.session.add(advertisement)
-        request.session.commit()
-        return jsonify(advertisement.dict)
+        self.session.add(advertisement)
+        await self.session.commit()
+        return web.json_response(advertisement.dict)
 
-    def delete(self, advertisement_id: int):
-        user = get_current_user()
-        advertisement = get_advertisement(advertisement_id)
+    async def delete(self):
+        user = await get_current_user(self.request)
+        advertisement = await get_advertisement(self.session, self.advertisement_id)
         check_owner(advertisement, user)
 
-        request.session.delete(advertisement)
-        request.session.commit()
-        return jsonify({"message": "deleted"})
+        await self.session.delete(advertisement)
+        await self.session.commit()
+        return web.json_response({"message": "deleted"})
 
 
-user_view = UserView.as_view("user")
-advertisement_view = AdvertisementView.as_view("advertisement")
-
-app.add_url_rule("/users", view_func=user_view, methods=["POST"])
-app.add_url_rule("/users/<int:user_id>", view_func=user_view, methods=["GET"])
-app.add_url_rule("/advertisements", view_func=advertisement_view, methods=["POST"])
-app.add_url_rule(
-    "/advertisements/<int:advertisement_id>",
-    view_func=advertisement_view,
-    methods=["GET", "PATCH", "DELETE"],
+app.add_routes(
+    [
+        web.post("/users", UserView),
+        web.get(r"/users/{user_id:\d+}", UserView),
+        web.post("/advertisements", AdvertisementView),
+        web.get(r"/advertisements/{advertisement_id:\d+}", AdvertisementView),
+        web.patch(r"/advertisements/{advertisement_id:\d+}", AdvertisementView),
+        web.delete(r"/advertisements/{advertisement_id:\d+}", AdvertisementView),
+    ]
 )
 
 
 if __name__ == "__main__":
-    app.run()
+    web.run_app(app, host="0.0.0.0", port=8080)

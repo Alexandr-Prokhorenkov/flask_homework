@@ -1,19 +1,11 @@
-import atexit
 import datetime
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import DateTime, ForeignKey, Integer, String, func
-from sqlalchemy.engine import create_engine
-from sqlalchemy.orm import (
-    DeclarativeBase,
-    Mapped,
-    MappedColumn,
-    mapped_column,
-    relationship,
-    sessionmaker,
-)
+from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, MappedColumn, mapped_column, relationship
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -24,17 +16,16 @@ POSTGRES_HOST = os.getenv("POSTGRES_HOST", "127.0.0.1")
 POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5431")
 
 POSTGRES_DSN = (
-    f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@"
+    f"postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@"
     f"{POSTGRES_HOST}:{POSTGRES_PORT}/"
     f"{POSTGRES_DB}"
 )
 
-engine = create_engine(POSTGRES_DSN)
-atexit.register(engine.dispose)
-Session = sessionmaker(bind=engine)
+engine = create_async_engine(POSTGRES_DSN)
+Session = async_sessionmaker(bind=engine, expire_on_commit=False)
 
 
-class Base(DeclarativeBase):
+class Base(DeclarativeBase, AsyncAttrs):
     pass
 
 
@@ -97,4 +88,10 @@ class Advertisement(Base):
         }
 
 
-Base.metadata.create_all(bind=engine)
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+async def close_db():
+    await engine.dispose()
